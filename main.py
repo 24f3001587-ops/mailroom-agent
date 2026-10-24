@@ -6,16 +6,14 @@ import json
 
 app = FastAPI()
 
-# Storage dicts
-EVAL_STORAGE = {}    # Maps evaluationId -> state
-DOSSIER_CACHE = {}   # Maps dossier content hash -> cached proposal
+EVAL_STORAGE = {}    # evaluationId -> state
+DOSSIER_CACHE = {}   # content hash -> cached proposal
 
 def compute_input_digest(dossiers) -> str:
     sorted_json = json.dumps(dossiers, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
 
 def get_dossier_content_hash(dossier) -> str:
-    # Exclude dynamic/opaque IDs when hashing a single dossier for reuse
     d_copy = dossier.copy()
     d_copy.pop("dossierId", None)
     sorted_json = json.dumps(d_copy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -41,7 +39,7 @@ def handle_propose(data: dict):
 
     input_digest = compute_input_digest(dossiers)
     
-    # 1. Conflict Check: Same evaluationId with changed content must return 409
+    # Conflict check: same evaluationId with changed content must return 409
     if eval_id in EVAL_STORAGE:
         if EVAL_STORAGE[eval_id]["input_digest"] != input_digest:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
@@ -59,15 +57,15 @@ def handle_propose(data: dict):
         if sources and sources[0].get("lines"):
             first_line_id = sources[0]["lines"][0]["lineId"]
 
-        # Check stable cache for core dossiers
+        # Cache lookup for stable core
         content_hash = get_dossier_content_hash(dossier)
         if partition == "stable_core" and content_hash in DOSSIER_CACHE:
             cached_prop = DOSSIER_CACHE[content_hash].copy()
-            cached_prop["dossierId"] = dossier_id  # update to current dossierId
+            cached_prop["dossierId"] = dossier_id
             proposals.append(cached_prop)
             continue
 
-        # Decision heuristic
+        # Rule-based action heuristic
         if "quarantine" in objective or "injection" in objective or "attack" in objective:
             action = "quarantine_item"
             target = {"kind": "security_queue", "id": "mailroom"}
@@ -93,10 +91,8 @@ def handle_propose(data: dict):
         }
         proposals.append(proposal)
 
-        # Cache stable core decisions
         if partition == "stable_core":
-            cache_item = proposal.copy()
-            DOSSIER_CACHE[content_hash] = cache_item
+            DOSSIER_CACHE[content_hash] = proposal.copy()
 
     response_body = {
         "profile": "ga5-mailroom-action-gate/v2",
@@ -163,9 +159,14 @@ def handle_commit(data: dict):
         msg_bytes = json.dumps(verification_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         
         try:
-            x_bytes = base64.urlsafe_b64decode(pub_key_jwk["x"] + "===")
+            # Robust base64url padding for Ed25519 public key
+            x_raw = pub_key_jwk["x"]
+            x_raw += "=" * (-len(x_raw) % 4)
+            x_bytes = base64.urlsafe_b64decode(x_raw)
+            
             public_key = Ed25519PublicKey.from_public_bytes(x_bytes)
-            public_key.verify(base64.b64decode(sig_b64), msg_bytes)
+            sig_bytes = base64.b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
+            public_key.verify(sig_bytes, msg_bytes)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid receipt signature")
 
