@@ -3,11 +3,27 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import base64
 import hashlib
 import json
+import os
 
 app = FastAPI()
 
-EVAL_STORAGE = {}    # evaluationId -> state
-DOSSIER_CACHE = {}   # content hash -> cached proposal
+STORAGE_FILE = "storage.json"
+
+def load_storage():
+    if os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {"evals": {}, "cache": {}}
+    return {"evals": {}, "cache": {}}
+
+def save_storage(data):
+    try:
+        with open(STORAGE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 def compute_input_digest(dossiers) -> str:
     sorted_json = json.dumps(dossiers, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -30,6 +46,7 @@ async def handle_mailroom(payload: dict):
         raise HTTPException(status_code=400, detail="Invalid operation")
 
 def handle_propose(data: dict):
+    store = load_storage()
     eval_id = data.get("evaluationId")
     dossiers = data.get("dossiers", [])
     verifier = data.get("receiptVerifier")
@@ -40,10 +57,10 @@ def handle_propose(data: dict):
     input_digest = compute_input_digest(dossiers)
     
     # Conflict check: same evaluationId with changed content must return 409
-    if eval_id in EVAL_STORAGE:
-        if EVAL_STORAGE[eval_id]["input_digest"] != input_digest:
+    if eval_id in store["evals"]:
+        if store["evals"][eval_id]["input_digest"] != input_digest:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-        return EVAL_STORAGE[eval_id]["propose_response"]
+        return store["evals"][eval_id]["propose_response"]
 
     proposals = []
     for dossier in dossiers:
@@ -57,15 +74,13 @@ def handle_propose(data: dict):
         if sources and sources[0].get("lines"):
             first_line_id = sources[0]["lines"][0]["lineId"]
 
-        # Cache lookup for stable core
         content_hash = get_dossier_content_hash(dossier)
-        if partition == "stable_core" and content_hash in DOSSIER_CACHE:
-            cached_prop = DOSSIER_CACHE[content_hash].copy()
+        if partition == "stable_core" and content_hash in store["cache"]:
+            cached_prop = store["cache"][content_hash].copy()
             cached_prop["dossierId"] = dossier_id
             proposals.append(cached_prop)
             continue
 
-        # Rule-based action heuristic
         if "quarantine" in objective or "injection" in objective or "attack" in objective:
             action = "quarantine_item"
             target = {"kind": "security_queue", "id": "mailroom"}
@@ -92,7 +107,7 @@ def handle_propose(data: dict):
         proposals.append(proposal)
 
         if partition == "stable_core":
-            DOSSIER_CACHE[content_hash] = proposal.copy()
+            store["cache"][content_hash] = proposal.copy()
 
     response_body = {
         "profile": "ga5-mailroom-action-gate/v2",
@@ -102,23 +117,25 @@ def handle_propose(data: dict):
         "proposals": proposals
     }
 
-    EVAL_STORAGE[eval_id] = {
+    store["evals"][eval_id] = {
         "input_digest": input_digest,
         "verifier": verifier,
         "proposals": {p["callId"]: p for p in proposals},
         "propose_response": response_body
     }
+    save_storage(store)
     return response_body
 
 def handle_commit(data: dict):
+    store = load_storage()
     eval_id = data.get("evaluationId")
     input_digest = data.get("inputDigest")
     receipts = data.get("receipts", [])
 
-    if eval_id not in EVAL_STORAGE:
+    if eval_id not in store["evals"]:
         raise HTTPException(status_code=400, detail="Unknown evaluation ID")
     
-    stored = EVAL_STORAGE[eval_id]
+    stored = store["evals"][eval_id]
     if stored["input_digest"] != input_digest:
         raise HTTPException(status_code=409, detail="Input digest mismatch")
 
@@ -128,6 +145,7 @@ def handle_commit(data: dict):
 
     pub_key_jwk = verifier["publicKeyJwk"]
     outcomes = []
+    seen_receipt_ids = set()
     
     for r in receipts:
         call_id = r.get("callId")
@@ -140,6 +158,10 @@ def handle_commit(data: dict):
 
         if not all([call_id, dossier_id, action, receipt_id, proposal_digest, sig_b64]):
             raise HTTPException(status_code=400, detail="Malformed receipt schema")
+
+        if receipt_id in seen_receipt_ids:
+            raise HTTPException(status_code=400, detail="Duplicate receipt ID")
+        seen_receipt_ids.add(receipt_id)
 
         inner_receipt = {
             "dossierId": dossier_id, 
@@ -159,7 +181,6 @@ def handle_commit(data: dict):
         msg_bytes = json.dumps(verification_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         
         try:
-            # Robust base64url padding for Ed25519 public key
             x_raw = pub_key_jwk["x"]
             x_raw += "=" * (-len(x_raw) % 4)
             x_bytes = base64.urlsafe_b64decode(x_raw)
