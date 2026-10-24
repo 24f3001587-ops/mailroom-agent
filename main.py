@@ -5,10 +5,20 @@ import hashlib
 import json
 
 app = FastAPI()
-STORAGE = {}
+
+# Storage dicts
+EVAL_STORAGE = {}    # Maps evaluationId -> state
+DOSSIER_CACHE = {}   # Maps dossier content hash -> cached proposal
 
 def compute_input_digest(dossiers) -> str:
     sorted_json = json.dumps(dossiers, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
+
+def get_dossier_content_hash(dossier) -> str:
+    # Exclude dynamic/opaque IDs when hashing a single dossier for reuse
+    d_copy = dossier.copy()
+    d_copy.pop("dossierId", None)
+    sorted_json = json.dumps(d_copy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
 
 @app.post("/")
@@ -31,10 +41,11 @@ def handle_propose(data: dict):
 
     input_digest = compute_input_digest(dossiers)
     
-    if eval_id in STORAGE:
-        if STORAGE[eval_id]["input_digest"] != input_digest:
+    # 1. Conflict Check: Same evaluationId with changed content must return 409
+    if eval_id in EVAL_STORAGE:
+        if EVAL_STORAGE[eval_id]["input_digest"] != input_digest:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-        return STORAGE[eval_id]["propose_response"]
+        return EVAL_STORAGE[eval_id]["propose_response"]
 
     proposals = []
     for dossier in dossiers:
@@ -42,13 +53,21 @@ def handle_propose(data: dict):
         objective = dossier.get("objective", "").lower()
         mailbox = dossier.get("mailbox", "default")
         sources = dossier.get("sources", [])
+        partition = dossier.get("partition", "stable_core")
         
-        # Collect first available line ID for evidence fallback
         first_line_id = "line_1"
         if sources and sources[0].get("lines"):
             first_line_id = sources[0]["lines"][0]["lineId"]
 
-        # Basic heuristic parsing based on dossier objective/content
+        # Check stable cache for core dossiers
+        content_hash = get_dossier_content_hash(dossier)
+        if partition == "stable_core" and content_hash in DOSSIER_CACHE:
+            cached_prop = DOSSIER_CACHE[content_hash].copy()
+            cached_prop["dossierId"] = dossier_id  # update to current dossierId
+            proposals.append(cached_prop)
+            continue
+
+        # Decision heuristic
         if "quarantine" in objective or "injection" in objective or "attack" in objective:
             action = "quarantine_item"
             target = {"kind": "security_queue", "id": "mailroom"}
@@ -64,14 +83,20 @@ def handle_propose(data: dict):
 
         call_id = hashlib.sha256(f"{eval_id}-{dossier_id}".encode()).hexdigest()[:20]
 
-        proposals.append({
+        proposal = {
             "dossierId": dossier_id,
             "callId": call_id,
             "action": action,
             "target": target,
             "payload": payload,
             "evidence": [first_line_id]
-        })
+        }
+        proposals.append(proposal)
+
+        # Cache stable core decisions
+        if partition == "stable_core":
+            cache_item = proposal.copy()
+            DOSSIER_CACHE[content_hash] = cache_item
 
     response_body = {
         "profile": "ga5-mailroom-action-gate/v2",
@@ -81,7 +106,7 @@ def handle_propose(data: dict):
         "proposals": proposals
     }
 
-    STORAGE[eval_id] = {
+    EVAL_STORAGE[eval_id] = {
         "input_digest": input_digest,
         "verifier": verifier,
         "proposals": {p["callId"]: p for p in proposals},
@@ -94,10 +119,10 @@ def handle_commit(data: dict):
     input_digest = data.get("inputDigest")
     receipts = data.get("receipts", [])
 
-    if eval_id not in STORAGE:
+    if eval_id not in EVAL_STORAGE:
         raise HTTPException(status_code=400, detail="Unknown evaluation ID")
     
-    stored = STORAGE[eval_id]
+    stored = EVAL_STORAGE[eval_id]
     if stored["input_digest"] != input_digest:
         raise HTTPException(status_code=409, detail="Input digest mismatch")
 
@@ -142,7 +167,6 @@ def handle_commit(data: dict):
             public_key = Ed25519PublicKey.from_public_bytes(x_bytes)
             public_key.verify(base64.b64decode(sig_b64), msg_bytes)
         except Exception:
-            # Strict rejection for invalid signatures (fixes invalid-receipt rejection check)
             raise HTTPException(status_code=400, detail="Invalid receipt signature")
 
         outcomes.append({
