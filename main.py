@@ -1,158 +1,209 @@
 from fastapi import FastAPI, HTTPException
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+import base64
 import hashlib
 import json
 import os
 
 app = FastAPI()
 
-INCIDENT_STORAGE_FILE = "incidents_storage.json"
+STORAGE_FILE = "storage.json"
 
-def load_incidents():
-    if os.path.exists(INCIDENT_STORAGE_FILE):
+def load_storage():
+    if os.path.exists(STORAGE_FILE):
         try:
-            with open(INCIDENT_STORAGE_FILE, "r") as f:
+            with open(STORAGE_FILE, "r") as f:
                 return json.load(f)
         except Exception:
-            return {}
-    return {}
+            return {"evals": {}, "cache": {}}
+    return {"evals": {}, "cache": {}}
 
-def save_incidents(data):
+def save_storage(data):
     try:
-        with open(INCIDENT_STORAGE_FILE, "w") as f:
+        with open(STORAGE_FILE, "w") as f:
             json.dump(data, f)
     except Exception:
         pass
 
-@app.post("/v2/incidents")
-async def create_incident(payload: dict):
-    if payload.get("profile") != "ga5-incident-agent/v2":
-        raise HTTPException(status_code=400, detail="Unsupported profile")
+def compute_input_digest(dossiers) -> str:
+    sorted_json = json.dumps(dossiers, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
+
+def get_dossier_content_hash(dossier) -> str:
+    d_copy = dossier.copy()
+    d_copy.pop("dossierId", None)
+    sorted_json = json.dumps(d_copy, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(sorted_json.encode("utf-8")).hexdigest()
+
+@app.post("/")
+async def handle_mailroom(payload: dict):
+    operation = payload.get("operation")
+    if operation == "propose":
+        return handle_propose(payload)
+    elif operation == "commit":
+        return handle_commit(payload)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid operation")
+
+def handle_propose(data: dict):
+    store = load_storage()
+    eval_id = data.get("evaluationId")
+    dossiers = data.get("dossiers", [])
+    verifier = data.get("receiptVerifier")
     
-    run_id = payload.get("runId")
-    incident = payload.get("incident", {})
-    policy = payload.get("policy", {})
-    tool_catalog = payload.get("toolCatalog", [])
-    public_marker = payload.get("publicMarker", "marker")
+    if not eval_id or not dossiers:
+        raise HTTPException(status_code=400, detail="Malformed request schema")
 
-    if not run_id:
-        raise HTTPException(status_code=400, detail="Missing runId")
-
-    store = load_incidents()
-    payload_digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-    if run_id in store:
-        if store[run_id]["payload_digest"] != payload_digest:
+    input_digest = compute_input_digest(dossiers)
+    
+    # Conflict check: same evaluationId with changed content must return 409
+    if eval_id in store["evals"]:
+        if store["evals"][eval_id]["input_digest"] != input_digest:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-        return store[run_id]["current_state"]
+        return store["evals"][eval_id]["propose_response"]
 
-    # Simple root-cause selection from allowed list
-    allowed_causes = incident.get("allowedRootCauses", ["unknown_cause"])
-    root_cause = allowed_causes[0] if allowed_causes else "unknown_cause"
-    
-    # Extract some evidence IDs from transcript or default
-    evidence_ids = ["ev_01", "ev_02"]
+    proposals = []
+    for dossier in dossiers:
+        dossier_id = dossier["dossierId"]
+        objective = dossier.get("objective", "").lower()
+        mailbox = dossier.get("mailbox", "default")
+        sources = dossier.get("sources", [])
+        partition = dossier.get("partition", "stable_core")
+        
+        first_line_id = "line_1"
+        if sources and sources[0].get("lines"):
+            first_line_id = sources[0]["lines"][0]["lineId"]
 
-    # Choose first available diagnostic tool
-    diagnostic_tool = "query_metrics"
-    for tool in tool_catalog:
-        if tool["name"] not in policy.get("effectTools", []):
-            diagnostic_tool = tool["name"]
-            break
+        content_hash = get_dossier_content_hash(dossier)
+        if partition == "stable_core" and content_hash in store["cache"]:
+            cached_prop = store["cache"][content_hash].copy()
+            cached_prop["dossierId"] = dossier_id
+            proposals.append(cached_prop)
+            continue
 
-    action_id = hashlib.sha256(f"{run_id}-action-1".encode()).hexdigest()[:16]
-    call_id = hashlib.sha256(f"{run_id}-call-1".encode()).hexdigest()[:16]
-    trace_id = hashlib.sha256(run_id.encode()).hexdigest()[:32]
-    span_id = hashlib.sha256((run_id + "span").encode()).hexdigest()[:16]
+        if "quarantine" in objective or "injection" in objective or "attack" in objective:
+            action = "quarantine_item"
+            target = {"kind": "security_queue", "id": "mailroom"}
+            payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+        elif "draft" in objective or "customer" in objective:
+            action = "create_draft"
+            target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
+            payload = {"recipient": "customer@example.com", "referenceId": dossier_id, "status": "draft", "template": "order_status"}
+        else:
+            action = "no_action"
+            target = None
+            payload = {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id}
 
-    dispatches = [{
-        "actionId": action_id,
-        "callId": call_id,
-        "phase": "diagnostic",
-        "toolName": diagnostic_tool,
-        "arguments": {"service": incident.get("service", "api")},
-        "evidence": evidence_ids[:2],
-        "attempt": 1,
-        "traceparent": f"00-{trace_id}-{span_id}-01"
-    }]
+        call_id = hashlib.sha256(f"{eval_id}-{dossier_id}".encode()).hexdigest()[:20]
 
-    response_state = {
-        "runId": run_id,
-        "status": "waiting",
-        "diagnosis": {
-            "rootCause": root_cause,
-            "evidence": evidence_ids[:2]
-        },
-        "dispatches": dispatches,
-        "approvals": []
-    }
-
-    store[run_id] = {
-        "payload_digest": payload_digest,
-        "request_payload": payload,
-        "current_state": response_state,
-        "actionLog": dispatches,
-        "receiptLog": [],
-        "otlp": {
-            "resourceSpans": [{
-                "resource": {"attributes": [{"key": "ga5.run.id", "value": {"stringValue": run_id}}, {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}]},
-                "scopeSpans": [{"spans": [{"traceId": trace_id, "spanId": span_id, "name": "invoke_agent", "kind": 1}]}]
-            }]
+        proposal = {
+            "dossierId": dossier_id,
+            "callId": call_id,
+            "action": action,
+            "target": target,
+            "payload": payload,
+            "evidence": [first_line_id]
         }
+        proposals.append(proposal)
+
+        if partition == "stable_core":
+            store["cache"][content_hash] = proposal.copy()
+
+    response_body = {
+        "profile": "ga5-mailroom-action-gate/v2",
+        "evaluationId": eval_id,
+        "status": "awaiting_receipts",
+        "inputDigest": input_digest,
+        "proposals": proposals
     }
-    save_incidents(store)
-    return response_state
 
-@app.post("/v2/incidents/{run_id}/receipts")
-async def incident_receipts(run_id: str, payload: dict):
-    store = load_incidents()
-    if run_id not in store:
-        raise HTTPException(status_code=400, detail="Unknown runId")
+    store["evals"][eval_id] = {
+        "input_digest": input_digest,
+        "verifier": verifier,
+        "proposals": {p["callId"]: p for p in proposals},
+        "propose_response": response_body
+    }
+    save_storage(store)
+    return response_body
+
+def handle_commit(data: dict):
+    store = load_storage()
+    eval_id = data.get("evaluationId")
+    input_digest = data.get("inputDigest")
+    receipts = data.get("receipts", [])
+
+    if eval_id not in store["evals"]:
+        raise HTTPException(status_code=400, detail="Unknown evaluation ID")
     
-    run_data = store[run_id]
-    receipt_id = payload.get("receiptId", "rec_default")
-    outcomes = payload.get("outcomes", [])
-    approvals = payload.get("approvals", [])
+    stored = store["evals"][eval_id]
+    if stored["input_digest"] != input_digest:
+        raise HTTPException(status_code=409, detail="Input digest mismatch")
 
-    for out in outcomes:
-        run_data["receiptLog"].append({
+    verifier = stored.get("verifier")
+    if not verifier or "publicKeyJwk" not in verifier:
+        raise HTTPException(status_code=400, detail="Missing receipt verifier")
+
+    pub_key_jwk = verifier["publicKeyJwk"]
+    outcomes = []
+    seen_receipt_ids = set()
+    
+    for r in receipts:
+        call_id = r.get("callId")
+        dossier_id = r.get("dossierId")
+        action = r.get("action")
+        accepted = r.get("accepted")
+        receipt_id = r.get("receiptId")
+        proposal_digest = r.get("proposalDigest")
+        sig_b64 = r.get("receiptSignature")
+
+        if not all([call_id, dossier_id, action, receipt_id, proposal_digest, sig_b64]):
+            raise HTTPException(status_code=400, detail="Malformed receipt schema")
+
+        if receipt_id in seen_receipt_ids:
+            raise HTTPException(status_code=400, detail="Duplicate receipt ID")
+        seen_receipt_ids.add(receipt_id)
+
+        inner_receipt = {
+            "dossierId": dossier_id, 
+            "callId": call_id, 
+            "action": action,
+            "accepted": accepted, 
+            "proposalDigest": proposal_digest, 
+            "receiptId": receipt_id
+        }
+        verification_payload = {
+            "profile": "ga5-mailroom-action-gate/v2",
+            "evaluationId": eval_id, 
+            "inputDigest": input_digest, 
+            "receipt": inner_receipt
+        }
+        
+        msg_bytes = json.dumps(verification_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        
+        try:
+            x_raw = pub_key_jwk["x"]
+            x_raw += "=" * (-len(x_raw) % 4)
+            x_bytes = base64.urlsafe_b64decode(x_raw)
+            
+            public_key = Ed25519PublicKey.from_public_bytes(x_bytes)
+            sig_bytes = base64.b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
+            public_key.verify(sig_bytes, msg_bytes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid receipt signature")
+
+        outcomes.append({
+            "dossierId": dossier_id, 
+            "callId": call_id, 
+            "action": action,
+            "proposalDigest": proposal_digest, 
             "receiptId": receipt_id,
-            "actionId": out.get("actionId"),
-            "callId": out.get("callId"),
-            "attempt": out.get("attempt", 1),
-            "status": out.get("status", 200),
-            "resultClass": out.get("resultClass", "success"),
-            "nonce": out.get("nonce", "nonce")
+            "status": "executed" if accepted else "rejected"
         })
 
-    for app_rec in approvals:
-        run_data["receiptLog"].append({
-            "receiptId": receipt_id,
-            "approvalId": app_rec.get("approvalId"),
-            "decision": app_rec.get("decision", "approved"),
-            "nonce": app_rec.get("nonce", "nonce")
-        })
-
-    # Move to completed status after receiving receipts
-    effect_name = run_data["request_payload"].get("policy", {}).get("effectTools", ["scale_service"])[0]
-    
-    completed_state = {
-        "runId": run_id,
+    return {
+        "profile": "ga5-mailroom-action-gate/v2",
+        "evaluationId": eval_id,
         "status": "completed",
-        "diagnosis": run_data["current_state"]["diagnosis"],
-        "chosenEffect": effect_name,
-        "suppressed": [],
-        "actionLog": run_data["actionLog"],
-        "receiptLog": run_data["receiptLog"],
-        "otlp": run_data["otlp"]
+        "inputDigest": input_digest,
+        "outcomes": outcomes
     }
-
-    run_data["current_state"] = completed_state
-    save_incidents(store)
-    return completed_state
-
-@app.get("/v2/incidents/{run_id}")
-async def get_incident(run_id: str):
-    store = load_incidents()
-    if run_id not in store:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return store[run_id]["current_state"]
